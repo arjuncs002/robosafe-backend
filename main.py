@@ -1,6 +1,7 @@
 import time
 import asyncio
 import secrets
+import cv2
 import os
 import numpy as np
 
@@ -91,15 +92,11 @@ ROVER_STATE = {
 }
 
 MMWAVE_STATE = {
-    "status": "NO PRESENCE DETECTED",
+    "status": "NO CONFIRMATION",
     "last_presence": 0,
     "energy_delta": 0,
     "respiration_detected": False,
-    "distance": 0,
-    "energy_min": 0,
-    "energy_max": 0,
     "last_update": 0,
-    "enabled": True,
 }
 
 MIN_LOG_GAP_SEC = 3.0
@@ -158,9 +155,19 @@ def video_generator():
             cv2.putText(blank, "Camera Offline", (180, 240), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
             ret, jpeg = cv2.imencode(".jpg", blank, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            frame_bytes = jpeg.tobytes()
         else:
-            frame_bytes = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.\' ",#\x1c\x1c(7),01444\x1f\'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xc4\x00\xb5\x10\x00\x02\x01\x03\x03\x02\x04\x03\x05\x05\x04\x04\x00\x00\x01}\x01\x02\x03\x00\x04\x11\x05\x12!1A\x06\x13Qa\x07"q\x142\x81\x91\xa1\x08#B\xb1\xc1\x15R\xd1\xf0$3br\x82\t\n\x16\x17\x18\x19\x1a%&\'()*456789:CDEFGHIJSTUVWXYZcdefghijstuvwxyz\x83\x84\x85\x86\x87\x88\x89\x8a\x92\x93\x94\x95\x96\x97\x98\x99\x9a\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xfb\xfc\x28\xa2\x8a\x00\xff\xd9'
+            from io import BytesIO
+            try:
+                from PIL import Image
+                img = Image.fromarray(blank.astype('uint8'), 'RGB')
+                buf = BytesIO()
+                img.save(buf, format='JPEG')
+                jpeg_bytes = buf.getvalue()
+            except:
+                jpeg_bytes = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.\' ",#\x1c\x1c(7),01444\x1f\'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xc4\x00\xb5\x10\x00\x02\x01\x03\x03\x02\x04\x03\x05\x05\x04\x04\x00\x00\x01}\x01\x02\x03\x00\x04\x11\x05\x12!1A\x06\x13Qa\x07"q\x142\x81\x91\xa1\x08#B\xb1\xc1\x15R\xd1\xf0$3br\x82\t\n\x16\x17\x18\x19\x1a%&\'()*456789:CDEFGHIJSTUVWXYZcdefghijstuvwxyz\x83\x84\x85\x86\x87\x88\x89\x8a\x92\x93\x94\x95\x96\x97\x98\x99\x9a\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xfb\xfc\x28\xa2\x8a\x00\xff\xd9'
+                ret = True
+                
+            frame_bytes = jpeg_bytes
         
         while True:
             yield (
@@ -255,13 +262,13 @@ async def change_password(request: Request, payload: dict | None = None):
 def get_state(request: Request, overlays: int = 1):
     verify_token(request)
     
+    # Auto-reset mmWave to NO CONFIRMATION if no update in 15 seconds
     now = time.time()
     if MMWAVE_STATE["last_update"] > 0 and (now - MMWAVE_STATE["last_update"]) > 15:
-        MMWAVE_STATE["status"] = "NO PRESENCE DETECTED"
+        MMWAVE_STATE["status"] = "NO CONFIRMATION"
         MMWAVE_STATE["last_presence"] = 0
         MMWAVE_STATE["energy_delta"] = 0
         MMWAVE_STATE["respiration_detected"] = False
-        MMWAVE_STATE["distance"] = 0
 
     response_data = {
         "ts": STATE["ts"],
@@ -292,24 +299,15 @@ async def update_mmwave(payload: dict | None = None):
     if payload is None:
         payload = {}
     
-    if not MMWAVE_STATE["enabled"]:
-        return {"ok": True, "message": "mmWave disabled"}
-    
-    status = payload.get("status", "NO PRESENCE DETECTED")
+    status = payload.get("status", "NO CONFIRMATION")
     presence = payload.get("last_presence", 0)
     energy_delta = payload.get("energy_delta", 0)
     respiration = payload.get("respiration_detected", False)
-    distance = payload.get("distance", 0)
-    energy_min = payload.get("energy_min", 0)
-    energy_max = payload.get("energy_max", 0)
     
     MMWAVE_STATE["status"] = status
     MMWAVE_STATE["last_presence"] = presence
     MMWAVE_STATE["energy_delta"] = energy_delta
     MMWAVE_STATE["respiration_detected"] = respiration
-    MMWAVE_STATE["distance"] = distance
-    MMWAVE_STATE["energy_min"] = energy_min
-    MMWAVE_STATE["energy_max"] = energy_max
     MMWAVE_STATE["last_update"] = time.time()
     
     try:
@@ -326,27 +324,9 @@ async def update_mmwave(payload: dict | None = None):
     except Exception as e:
         print(f"DB Error: {e}")
     
-    print(f"[mmWave] {status}, Distance: {distance}m, Delta: {energy_delta}")
+    print(f"[mmWave] Status: {status}, Presence: {presence}, Delta: {energy_delta}, Respiration: {respiration}")
     
     return {"ok": True}
-
-@app.post("/api/mmwave/toggle")
-async def toggle_mmwave(request: Request, payload: dict | None = None):
-    verify_token(request)
-    
-    if payload is None:
-        payload = {}
-    
-    enabled = payload.get("enabled", True)
-    MMWAVE_STATE["enabled"] = enabled
-    
-    if not enabled:
-        MMWAVE_STATE["status"] = "SENSOR DISABLED"
-        MMWAVE_STATE["last_presence"] = 0
-        MMWAVE_STATE["energy_delta"] = 0
-        MMWAVE_STATE["distance"] = 0
-    
-    return {"ok": True, "enabled": enabled}
 
 @app.get("/api/mmwave")
 def get_mmwave(request: Request):
