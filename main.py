@@ -118,7 +118,7 @@ def save_detection(count: int):
 def detect_and_draw(frame):
     if model is None or not CV2_AVAILABLE:
         return frame, 0, []
-    
+
     results = model.predict(frame, verbose=False)[0]
     count = 0
     dets = []
@@ -155,13 +155,13 @@ def video_generator():
     if not USE_LOCAL_CAMERA or cap is None or not CV2_AVAILABLE:
         blank = np.ones((480, 640, 3), dtype=np.uint8) * 30
         if CV2_AVAILABLE:
-            cv2.putText(blank, "Camera Offline", (180, 240), 
+            cv2.putText(blank, "Camera Offline", (180, 240),
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
             ret, jpeg = cv2.imencode(".jpg", blank, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             frame_bytes = jpeg.tobytes()
         else:
             frame_bytes = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.\' ",#\x1c\x1c(7),01444\x1f\'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xc4\x00\xb5\x10\x00\x02\x01\x03\x03\x02\x04\x03\x05\x05\x04\x04\x00\x00\x01}\x01\x02\x03\x00\x04\x11\x05\x12!1A\x06\x13Qa\x07"q\x142\x81\x91\xa1\x08#B\xb1\xc1\x15R\xd1\xf0$3br\x82\t\n\x16\x17\x18\x19\x1a%&\'()*456789:CDEFGHIJSTUVWXYZcdefghijstuvwxyz\x83\x84\x85\x86\x87\x88\x89\x8a\x92\x93\x94\x95\x96\x97\x98\x99\x9a\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xfb\xfc\x28\xa2\x8a\x00\xff\xd9'
-        
+
         while True:
             yield (
                 b"--frame\r\n"
@@ -322,24 +322,27 @@ async def update_mmwave(payload: dict | None = None):
         MMWAVE_STATE["energy_max"]           = energy_max
         MMWAVE_STATE["last_update"]          = time.time()
 
-        try:
-            db = SessionLocal()
-            db.add(MMWaveState(
-                ts=time.time(),
-                status=status,
-                presence=presence,
-                energy_delta=energy_delta,
-                respiration_detected=respiration
-            ))
-            db.commit()
-            db.close()
-        except Exception as e:
-            print(f"DB Error: {e}")
+        # Save to DB in background - don't block response
+        asyncio.create_task(_save_mmwave(status, presence, energy_delta, respiration))
 
         print(f"[mmWave] {status}, Distance: {distance}m, Delta: {energy_delta}")
 
-    # Always return enabled state so ESP32 knows which mode to run
     return {"ok": True, "enabled": enabled}
+
+async def _save_mmwave(status, presence, energy_delta, respiration):
+    try:
+        db = SessionLocal()
+        db.add(MMWaveState(
+            ts=time.time(),
+            status=status,
+            presence=presence,
+            energy_delta=energy_delta,
+            respiration_detected=respiration
+        ))
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"DB Error: {e}")
 
 @app.post("/api/mmwave/toggle")
 async def toggle_mmwave(request: Request, payload: dict | None = None):
@@ -359,14 +362,13 @@ async def toggle_mmwave(request: Request, payload: dict | None = None):
         MMWAVE_STATE["energy_min"]           = 0
         MMWAVE_STATE["energy_max"]           = 0
         MMWAVE_STATE["respiration_detected"] = False
-        # Reset rover to STOP when switching to rover mode
-        ROVER_STATE["last_command"]    = "STOP"
-        ROVER_STATE["last_command_ts"] = time.time()
+        ROVER_STATE["last_command"]          = "STOP"
+        ROVER_STATE["last_command_ts"]       = time.time()
     else:
         MMWAVE_STATE["status"]      = "NO PRESENCE DETECTED"
         MMWAVE_STATE["last_update"] = 0
 
-    print(f"[mmWave] {'ENABLED → motors STOPPED' if enabled else 'DISABLED → rover mode active'}")
+    print(f"[mmWave] {'ENABLED' if enabled else 'DISABLED'}")
 
     return {"ok": True, "enabled": enabled}
 
@@ -423,13 +425,19 @@ async def control_rover(request: Request, payload: dict | None = None):
     if command not in valid_commands:
         raise HTTPException(status_code=400, detail="Invalid command")
 
-    # If mmWave is enabled, block motor commands (sensor takes priority)
     if MMWAVE_STATE["enabled"] and command != "STOP":
         return JSONResponse({"ok": False, "reason": "mmWave active - motors disabled"})
 
     ROVER_STATE["last_command"]    = command
     ROVER_STATE["last_command_ts"] = time.time()
 
+    # Save to DB in background - don't block response
+    asyncio.create_task(_save_command(command))
+
+    print(f"[ROVER] Command: {command}")
+    return {"ok": True, "command": command, "ts": ROVER_STATE["last_command_ts"]}
+
+async def _save_command(command: str):
     try:
         db = SessionLocal()
         db.add(ControlCommand(ts=time.time(), command=command))
@@ -437,10 +445,6 @@ async def control_rover(request: Request, payload: dict | None = None):
         db.close()
     except Exception as e:
         print(f"DB Error: {e}")
-
-    print(f"[ROVER] Command: {command}")
-
-    return {"ok": True, "command": command, "ts": ROVER_STATE["last_command_ts"]}
 
 @app.get("/api/control/latest")
 async def get_latest_command():
