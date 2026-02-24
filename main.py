@@ -211,7 +211,7 @@ def video_generator():
 @app.get("/")
 def root():
     return {
-        "ok": True, 
+        "ok": True,
         "service": "robosafe-backend",
         "camera_enabled": USE_LOCAL_CAMERA and CV2_AVAILABLE
     }
@@ -254,7 +254,7 @@ async def change_password(request: Request, payload: dict | None = None):
 @app.get("/api/state")
 def get_state(request: Request, overlays: int = 1):
     verify_token(request)
-    
+
     now = time.time()
     if MMWAVE_STATE["last_update"] > 0 and (now - MMWAVE_STATE["last_update"]) > 15:
         MMWAVE_STATE["status"] = "NO PRESENCE DETECTED"
@@ -267,7 +267,17 @@ def get_state(request: Request, overlays: int = 1):
         "ts": STATE["ts"],
         "human_count": STATE["human_count"],
         "detections": STATE["detections"] if overlays == 1 else [],
-        "mmwave": MMWAVE_STATE,
+        "mmwave": {
+            "status": MMWAVE_STATE["status"],
+            "last_presence": MMWAVE_STATE["last_presence"],
+            "energy_delta": MMWAVE_STATE["energy_delta"],
+            "respiration_detected": MMWAVE_STATE["respiration_detected"],
+            "distance": MMWAVE_STATE["distance"],
+            "energy_min": MMWAVE_STATE["energy_min"],
+            "energy_max": MMWAVE_STATE["energy_max"],
+            "last_update": MMWAVE_STATE["last_update"],
+            "enabled": MMWAVE_STATE["enabled"],
+        },
     }
 
     return JSONResponse(response_data)
@@ -276,78 +286,88 @@ def get_state(request: Request, overlays: int = 1):
 async def update_state(request: Request, payload: dict | None = None):
     if payload is None:
         payload = {}
-    
+
     STATE["ts"] = time.time()
     STATE["human_count"] = payload.get("human_count", 0)
     STATE["detections"] = payload.get("detections", [])
-    
+
     count = STATE["human_count"]
     if count > 0:
         save_detection(count)
-    
+
     return {"ok": True}
 
 @app.post("/api/mmwave")
 async def update_mmwave(payload: dict | None = None):
     if payload is None:
         payload = {}
-    
-    if not MMWAVE_STATE["enabled"]:
-        return {"ok": True, "message": "mmWave disabled"}
-    
-    status = payload.get("status", "NO PRESENCE DETECTED")
-    presence = payload.get("last_presence", 0)
-    energy_delta = payload.get("energy_delta", 0)
-    respiration = payload.get("respiration_detected", False)
-    distance = payload.get("distance", 0)
-    energy_min = payload.get("energy_min", 0)
-    energy_max = payload.get("energy_max", 0)
-    
-    MMWAVE_STATE["status"] = status
-    MMWAVE_STATE["last_presence"] = presence
-    MMWAVE_STATE["energy_delta"] = energy_delta
-    MMWAVE_STATE["respiration_detected"] = respiration
-    MMWAVE_STATE["distance"] = distance
-    MMWAVE_STATE["energy_min"] = energy_min
-    MMWAVE_STATE["energy_max"] = energy_max
-    MMWAVE_STATE["last_update"] = time.time()
-    
-    try:
-        db = SessionLocal()
-        db.add(MMWaveState(
-            ts=time.time(),
-            status=status,
-            presence=presence,
-            energy_delta=energy_delta,
-            respiration_detected=respiration
-        ))
-        db.commit()
-        db.close()
-    except Exception as e:
-        print(f"DB Error: {e}")
-    
-    print(f"[mmWave] {status}, Distance: {distance}m, Delta: {energy_delta}")
-    
-    return {"ok": True}
+
+    enabled = MMWAVE_STATE["enabled"]
+
+    if enabled:
+        status       = payload.get("status", "NO PRESENCE DETECTED")
+        presence     = payload.get("last_presence", 0)
+        energy_delta = payload.get("energy_delta", 0)
+        respiration  = payload.get("respiration_detected", False)
+        distance     = payload.get("distance", 0)
+        energy_min   = payload.get("energy_min", 0)
+        energy_max   = payload.get("energy_max", 0)
+
+        MMWAVE_STATE["status"]               = status
+        MMWAVE_STATE["last_presence"]        = presence
+        MMWAVE_STATE["energy_delta"]         = energy_delta
+        MMWAVE_STATE["respiration_detected"] = respiration
+        MMWAVE_STATE["distance"]             = distance
+        MMWAVE_STATE["energy_min"]           = energy_min
+        MMWAVE_STATE["energy_max"]           = energy_max
+        MMWAVE_STATE["last_update"]          = time.time()
+
+        try:
+            db = SessionLocal()
+            db.add(MMWaveState(
+                ts=time.time(),
+                status=status,
+                presence=presence,
+                energy_delta=energy_delta,
+                respiration_detected=respiration
+            ))
+            db.commit()
+            db.close()
+        except Exception as e:
+            print(f"DB Error: {e}")
+
+        print(f"[mmWave] {status}, Distance: {distance}m, Delta: {energy_delta}")
+
+    # Always return enabled state so ESP32 knows which mode to run
+    return {"ok": True, "enabled": enabled}
 
 @app.post("/api/mmwave/toggle")
 async def toggle_mmwave(request: Request, payload: dict | None = None):
     verify_token(request)
-    
+
     if payload is None:
         payload = {}
-    
+
     enabled = payload.get("enabled", True)
     MMWAVE_STATE["enabled"] = enabled
-    
+
     if not enabled:
-        MMWAVE_STATE["status"] = "SENSOR DISABLED"
-        MMWAVE_STATE["last_presence"] = 0
-        MMWAVE_STATE["energy_delta"] = 0
-        MMWAVE_STATE["distance"] = 0
-    
-    print(f"[mmWave] Sensor {'enabled' if enabled else 'disabled'}")
-    
+        MMWAVE_STATE["status"]               = "SENSOR DISABLED"
+        MMWAVE_STATE["last_presence"]        = 0
+        MMWAVE_STATE["energy_delta"]         = 0
+        MMWAVE_STATE["distance"]             = 0
+        MMWAVE_STATE["energy_min"]           = 0
+        MMWAVE_STATE["energy_max"]           = 0
+        MMWAVE_STATE["respiration_detected"] = False
+        # Reset rover to STOP when switching to rover mode
+        ROVER_STATE["last_command"]    = "STOP"
+        ROVER_STATE["last_command_ts"] = time.time()
+    else:
+        MMWAVE_STATE["status"]      = "NO PRESENCE DETECTED"
+        MMWAVE_STATE["last_update"] = 0
+
+    print(f"[mmWave] {'ENABLED → motors STOPPED' if enabled else 'DISABLED → rover mode active'}")
+
     return {"ok": True, "enabled": enabled}
 
 @app.get("/api/mmwave")
@@ -379,7 +399,7 @@ def delete_history(request: Request):
         db.close()
     except Exception as e:
         print(f"DB Error: {e}")
-    
+
     return {"ok": True}
 
 @app.get("/video")
@@ -403,7 +423,11 @@ async def control_rover(request: Request, payload: dict | None = None):
     if command not in valid_commands:
         raise HTTPException(status_code=400, detail="Invalid command")
 
-    ROVER_STATE["last_command"] = command
+    # If mmWave is enabled, block motor commands (sensor takes priority)
+    if MMWAVE_STATE["enabled"] and command != "STOP":
+        return JSONResponse({"ok": False, "reason": "mmWave active - motors disabled"})
+
+    ROVER_STATE["last_command"]    = command
     ROVER_STATE["last_command_ts"] = time.time()
 
     try:
