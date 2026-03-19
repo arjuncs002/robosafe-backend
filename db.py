@@ -15,7 +15,7 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 
-# ─── PHASE 1 MODELS (unchanged) ───────────────────────────────────────────────
+# ─── PHASE 1 MODELS ───────────────────────────────────────────────────────────
 
 class Detection(Base):
     __tablename__ = "detections"
@@ -45,11 +45,7 @@ class MMWaveState(Base):
 # ─── PHASE 2 MODELS ───────────────────────────────────────────────────────────
 
 class MapFlag(Base):
-    """
-    A flag dropped on the map when an event occurs.
-    flag_type: detected | arrived | alive | not_alive
-    x, y     : rover position in metres at time of flag
-    """
+    """Flag dropped on map at detection/arrival events."""
     __tablename__ = "map_flags"
     id        = Column(Integer, primary_key=True, index=True)
     ts        = Column(Float,   index=True)
@@ -60,37 +56,24 @@ class MapFlag(Base):
 
 
 class RoverPosition(Base):
-    """Periodic rover position snapshot for drawing the track on the map."""
+    """Periodic rover position for drawing track on map."""
     __tablename__ = "rover_positions"
     id      = Column(Integer, primary_key=True, index=True)
     ts      = Column(Float,   index=True)
     x       = Column(Float,   default=0.0)
     y       = Column(Float,   default=0.0)
-    heading = Column(Float,   default=0.0)   # radians
+    heading = Column(Float,   default=0.0)
 
 
 class DriveMode(Base):
-    """Persists the current drive mode (AUTO / MANUAL). Only one row used."""
+    """Current drive mode — only one row used."""
     __tablename__ = "drive_mode"
     id   = Column(Integer, primary_key=True, index=True)
-    mode = Column(String,  default="MANUAL")   # AUTO | MANUAL
-
-
-class LifeConfirmation(Base):
-    """
-    Written by website when operator confirms life status.
-    Jetson polls this and clears it after reading.
-    """
-    __tablename__ = "life_confirmations"
-    id        = Column(Integer, primary_key=True, index=True)
-    ts        = Column(Float,   index=True)
-    confirmed = Column(Boolean, default=False)
-    result    = Column(String,  default="")    # alive | not_alive
-    cleared   = Column(Boolean, default=False)
+    mode = Column(String,  default="MANUAL")
 
 
 class AutoCommand(Base):
-    """Latest auto-drive command from Jetson (HTTP fallback path)."""
+    """Latest auto-drive command from Jetson (HTTP fallback)."""
     __tablename__ = "auto_commands"
     id      = Column(Integer, primary_key=True, index=True)
     ts      = Column(Float,   index=True)
