@@ -1,23 +1,7 @@
 #!/usr/bin/env python3
 """
-ROBOSAFE - Jetson Nano Main - FINAL v2
-=======================================
-AUTO MODE:
-  - YOLO detects human
-  - Sends FORWARD/LEFT/RIGHT/STOP directly to ESP32 via UART
-  - Keeps human centered in frame
-  - Stops at ~1-1.5m (bbox area threshold)
-  - Posts alert to backend → popup on dashboard
-  - Waits for operator vitals confirm
-  - Does 360 spin → scans again
-  - After 2x 360 with no human → posts manual mode request
-
-MANUAL MODE:
-  - Jetson sends NO drive commands
-  - Only posts detection state + rover position to backend
-  - ESP32 gets commands from dashboard via WiFi
-
-RUNS ON BOOT via systemd service.
+ROBOSAFE - Jetson Nano Main (FINAL)
+Camera: Essecloud via RJ45 at 192.168.1.88
 """
 
 import cv2
@@ -30,30 +14,27 @@ from concurrent.futures import ThreadPoolExecutor
 from ultralytics import YOLO
 
 # ============================================================
-# CONFIG — Edit these to match your setup
+# CONFIG
 # ============================================================
-BACKEND_URL   = "https://robosafe-backend.onrender.com"
-RTSP_URL      = "rtsp://admin:@192.168.29.192:554/ch0_0.264"
-MODEL_PATH    = "/home/project/robosafe/yolov8n.pt"   # FIXED: correct path on Jetson
-SERIAL_PORT   = "/dev/ttyTHS1"                        # FIXED: correct Jetson UART port
-SERIAL_BAUD   = 115200
-FRAME_WIDTH   = 640
-FRAME_HEIGHT  = 480
+BACKEND_URL    = "https://robosafe-backend.onrender.com"
+RTSP_URL       = "rtsp://admin:@192.168.1.88:554/ch0_0.264"  # RJ45 direct
+MODEL_PATH     = "/home/project/robosafe/yolov8n.pt"
+SERIAL_PORT    = "/dev/ttyTHS1"
+SERIAL_BAUD    = 115200
+FRAME_WIDTH    = 640
+FRAME_HEIGHT   = 480
 
-# Auto-drive
-STOP_AREA_RATIO         = 0.28   # stop when human bbox > 28% frame area (~1-1.5m)
-DEAD_ZONE_PX            = 50     # pixels from centre = go straight
-LOST_FRAMES_BEFORE_SCAN = 25     # frames without human → back to scan
+# Auto-drive thresholds
+STOP_AREA_RATIO         = 0.30
+LOST_FRAMES_BEFORE_SCAN = 20
+DEAD_ZONE_PX            = 40
 
 # Odometry
-BASE_SPEED_MPS = 0.15
-TURN_DEG_PER_S = 60.0
+BASE_SPEED_MPS    = 0.15
+SPIN_360_DURATION = 3.5
 
-# 360 spin duration — tune based on your rover's turn speed
-SPIN_360_DURATION = 3.5   # seconds
-
-# Max 360 spins before asking operator to switch to manual
-MAX_EMPTY_SPINS = 2
+# HTTP rate limit
+HTTP_CMD_RATE_LIMIT = 0.3
 
 # ============================================================
 # SERIAL
@@ -64,40 +45,54 @@ def init_serial():
     global ser
     try:
         ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.1)
-        time.sleep(0.5)
         print(f"[Serial] Connected: {SERIAL_PORT}")
-        return True
     except Exception as e:
-        print(f"[Serial] WARN: {e}")
+        print(f"[Serial] WARN: {e} — HTTP fallback only")
         ser = None
-        return False
 
 def send_serial(cmd: str):
-    """Send command to ESP32 via UART."""
-    global ser
     if ser and ser.is_open:
         try:
             ser.write((cmd.strip() + "\n").encode())
-        except Exception as e:
-            print(f"[Serial] Write error: {e}")
-            ser = None
+        except Exception:
+            pass
+
+# ============================================================
+# HTTP COMMAND
+# ============================================================
+_http_lock     = threading.Lock()
+_last_http_cmd = ""
+_last_http_ts  = 0.0
+
+def send_http_command(cmd: str):
+    global _last_http_cmd, _last_http_ts
+    now = time.time()
+    with _http_lock:
+        if cmd == _last_http_cmd and (now - _last_http_ts) < HTTP_CMD_RATE_LIMIT:
+            return
+        _last_http_cmd = cmd
+        _last_http_ts  = now
+    try:
+        requests.post(f"{BACKEND_URL}/api/auto_command",
+                      json={"command": cmd}, timeout=1.5)
+    except Exception:
+        pass
 
 def send_command(cmd: str):
     send_serial(cmd)
+    send_http_command(cmd)
 
 # ============================================================
-# BACKEND CALLS (non-blocking thread pool)
+# BACKEND HELPERS
 # ============================================================
 _executor = ThreadPoolExecutor(max_workers=4)
 
 def post_state(human_count: int, detections: list):
     def _do():
         try:
-            requests.post(
-                f"{BACKEND_URL}/api/state",
-                json={"human_count": human_count, "detections": detections},
-                timeout=2,
-            )
+            requests.post(f"{BACKEND_URL}/api/state",
+                          json={"human_count": human_count,
+                                "detections": detections}, timeout=2)
         except Exception:
             pass
     _executor.submit(_do)
@@ -105,12 +100,9 @@ def post_state(human_count: int, detections: list):
 def post_map_flag(flag_type: str, x: float, y: float, label: str = ""):
     def _do():
         try:
-            requests.post(
-                f"{BACKEND_URL}/api/map/flag",
-                json={"flag_type": flag_type, "x": x, "y": y,
-                      "label": label, "ts": time.time()},
-                timeout=2,
-            )
+            requests.post(f"{BACKEND_URL}/api/map/flag",
+                          json={"flag_type": flag_type, "x": x, "y": y,
+                                "label": label, "ts": time.time()}, timeout=2)
         except Exception:
             pass
     _executor.submit(_do)
@@ -118,36 +110,9 @@ def post_map_flag(flag_type: str, x: float, y: float, label: str = ""):
 def post_rover_position(x: float, y: float, heading: float):
     def _do():
         try:
-            requests.post(
-                f"{BACKEND_URL}/api/map/position",
-                json={"x": x, "y": y, "heading": heading, "ts": time.time()},
-                timeout=1,
-            )
-        except Exception:
-            pass
-    _executor.submit(_do)
-
-def post_alert():
-    def _do():
-        try:
-            requests.post(
-                f"{BACKEND_URL}/api/alert",
-                json={"type": "siren", "ts": time.time()},
-                timeout=2,
-            )
-        except Exception:
-            pass
-    _executor.submit(_do)
-
-def post_manual_request():
-    """Ask dashboard to switch to manual — no humans found after 2 spins."""
-    def _do():
-        try:
-            requests.post(
-                f"{BACKEND_URL}/api/manual_request",
-                json={"reason": "No human found after 2 scans", "ts": time.time()},
-                timeout=2,
-            )
+            requests.post(f"{BACKEND_URL}/api/map/position",
+                          json={"x": x, "y": y, "heading": heading,
+                                "ts": time.time()}, timeout=1)
         except Exception:
             pass
     _executor.submit(_do)
@@ -161,19 +126,26 @@ def get_mode() -> str:
         pass
     return "MANUAL"
 
-def get_life_confirm():
+def post_alert():
     try:
-        r = requests.get(f"{BACKEND_URL}/api/life_confirm/pending", timeout=2)
+        requests.post(f"{BACKEND_URL}/api/alert",
+                      json={"type": "siren", "ts": time.time()}, timeout=1)
+    except Exception:
+        pass
+
+def get_life_confirm_pending():
+    try:
+        r = requests.get(f"{BACKEND_URL}/api/life_confirm/pending", timeout=1)
         if r.status_code == 200:
-            data = r.json()
-            return data.get("confirmed", False), data.get("result", "")
+            d = r.json()
+            return d.get("confirmed", False), d.get("result", "")
     except Exception:
         pass
     return False, ""
 
 def clear_life_confirm():
     try:
-        requests.post(f"{BACKEND_URL}/api/life_confirm/clear", timeout=2)
+        requests.post(f"{BACKEND_URL}/api/life_confirm/clear", timeout=1)
     except Exception:
         pass
 
@@ -182,55 +154,46 @@ def clear_life_confirm():
 # ============================================================
 class Odometry:
     def __init__(self):
-        self.x       = 0.0
-        self.y       = 0.0
-        self.heading = 0.0
-        self._last   = time.time()
+        self.x        = 0.0
+        self.y        = 0.0
+        self.heading  = 0.0
+        self._last_ts = time.time()
 
     def update(self, cmd: str):
         now  = time.time()
-        dt   = now - self._last
-        self._last = now
+        dt   = now - self._last_ts
+        self._last_ts = now
         dist = BASE_SPEED_MPS * dt
-
         if cmd == "FORWARD":
             self.x += dist * math.sin(self.heading)
             self.y += dist * math.cos(self.heading)
         elif cmd == "BACKWARD":
             self.x -= dist * math.sin(self.heading)
             self.y -= dist * math.cos(self.heading)
-        elif cmd == "LEFT":
-            self.heading -= math.radians(TURN_DEG_PER_S) * dt
-        elif cmd == "RIGHT":
-            self.heading += math.radians(TURN_DEG_PER_S) * dt
+        elif cmd in ("LEFT", "RIGHT"):
+            sign = -1 if cmd == "LEFT" else 1
+            self.heading += sign * math.radians(60) * dt
 
-    def pos(self):
+    def position(self):
         return self.x, self.y, self.heading
 
 # ============================================================
 # STEERING
 # ============================================================
-def get_steering(bbox, frame_w, frame_h):
-    """Returns (cmd, arrived)."""
+def get_steering_command(bbox, frame_w, frame_h):
     x1, y1, x2, y2 = bbox
     area       = (x2 - x1) * (y2 - y1)
     frame_area = frame_w * frame_h
-
     if area / frame_area >= STOP_AREA_RATIO:
         return "STOP", True
-
     cx    = (x1 + x2) // 2
     error = cx - (frame_w // 2)
-
     if abs(error) < DEAD_ZONE_PX:
         return "FORWARD", False
-    elif error < 0:
-        return "LEFT", False
-    else:
-        return "RIGHT", False
+    return ("LEFT", False) if error < 0 else ("RIGHT", False)
 
 # ============================================================
-# AUTO DRIVE STATE MACHINE
+# AUTO-DRIVE STATE MACHINE
 # ============================================================
 class AutoDriver:
     SCAN     = "SCAN"
@@ -240,84 +203,71 @@ class AutoDriver:
     SPIN360  = "SPIN360"
 
     def __init__(self, odo: Odometry):
-        self.odo         = odo
         self.state       = self.SCAN
+        self.odo         = odo
         self.lost_frames = 0
+        self.scan_dir    = "LEFT"
         self.alert_sent  = False
         self.spin_start  = 0.0
-        self.empty_spins = 0
 
     def reset(self):
         self.state       = self.SCAN
         self.lost_frames = 0
         self.alert_sent  = False
-        self.empty_spins = 0
 
     def step(self, detections: list, frame_w: int, frame_h: int) -> str:
-        x, y, heading = self.odo.pos()
+        x, y, heading = self.odo.position()
 
         if self.state == self.SCAN:
             if detections:
-                print("[Auto] Human found → APPROACH")
+                print("[AutoDrive] Human found → APPROACH")
                 self.state       = self.APPROACH
                 self.lost_frames = 0
-                self.empty_spins = 0
                 post_map_flag("detected", x, y, "Human detected")
-            return "LEFT"
+            return self.scan_dir
 
         elif self.state == self.APPROACH:
             if not detections:
                 self.lost_frames += 1
                 if self.lost_frames > LOST_FRAMES_BEFORE_SCAN:
-                    print("[Auto] Lost human → SCAN")
+                    print("[AutoDrive] Lost human → SCAN")
                     self.state = self.SCAN
-                    return "LEFT"
+                    return self.scan_dir
                 return "FORWARD"
-
             self.lost_frames = 0
             best = max(detections,
                        key=lambda d: (d["bbox"][2]-d["bbox"][0]) *
                                      (d["bbox"][3]-d["bbox"][1]))
-            cmd, arrived = get_steering(best["bbox"], frame_w, frame_h)
-
-            if arrived:
-                print("[Auto] Arrived at human → ARRIVED")
+            cmd, stop = get_steering_command(best["bbox"], frame_w, frame_h)
+            if stop:
+                print("[AutoDrive] Arrived → ARRIVED")
                 post_map_flag("arrived", x, y, "Rover arrived")
                 self.state      = self.ARRIVED
                 self.alert_sent = False
-
             return cmd
 
         elif self.state == self.ARRIVED:
             if not self.alert_sent:
                 self.alert_sent = True
-                post_alert()
-                print("[Auto] Alert sent → WAITING")
+                _executor.submit(post_alert)
+                print("[AutoDrive] Siren alert sent → WAITING")
                 self.state = self.WAITING
             return "STOP"
 
         elif self.state == self.WAITING:
-            confirmed, result = get_life_confirm()
+            confirmed, result = get_life_confirm_pending()
             if confirmed:
                 flag_type = "alive" if result == "alive" else "not_alive"
                 post_map_flag(flag_type, x, y, f"Life: {result}")
                 clear_life_confirm()
-                print(f"[Auto] Vitals: {result} → SPIN360")
+                print(f"[AutoDrive] Vitals: {result} → SPIN360")
                 self.state      = self.SPIN360
                 self.spin_start = time.time()
             return "STOP"
 
         elif self.state == self.SPIN360:
-            elapsed = time.time() - self.spin_start
-            if elapsed >= SPIN_360_DURATION:
-                self.empty_spins += 1
-                print(f"[Auto] Spin done ({self.empty_spins}/{MAX_EMPTY_SPINS}) → SCAN")
-
-                if self.empty_spins >= MAX_EMPTY_SPINS:
-                    print("[Auto] No human found after 2 spins → requesting MANUAL")
-                    post_manual_request()
-                    self.empty_spins = 0
-
+            if time.time() - self.spin_start >= SPIN_360_DURATION:
+                print("[AutoDrive] Spin done → SCAN")
                 self.state = self.SCAN
                 return "STOP"
             return "LEFT"
@@ -325,23 +275,112 @@ class AutoDriver:
         return "STOP"
 
 # ============================================================
-# CAMERA
+# FRAME GRABBER THREAD
+# Runs in background — grabs frames continuously so buffer
+# never fills up. Main thread reads latest frame only.
 # ============================================================
-def open_camera(url: str):
-    cap = cv2.VideoCapture(url)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    if cap.isOpened():
-        print(f"[Camera] Opened: {url}")
-    else:
-        print(f"[Camera] Failed: {url}")
-    return cap
+class FrameGrabber:
+    def __init__(self, url: str):
+        self.url     = url
+        self._frame  = None
+        self._lock   = threading.Lock()
+        self.running = True
+        self._t      = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def _open(self):
+        cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"[Camera] Opened {w}x{h} ✓")
+        else:
+            print(f"[Camera] FAILED to open!")
+        return cap
+
+    def _loop(self):
+        cap        = self._open()
+        fail_count = 0
+        while self.running:
+            if not cap or not cap.isOpened():
+                time.sleep(2.0)
+                cap = self._open()
+                continue
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                fail_count = 0
+                # Resize immediately — faster YOLO + less memory
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+                with self._lock:
+                    self._frame = frame
+            else:
+                fail_count += 1
+                if fail_count > 10:
+                    print("[Camera] Reconnecting...")
+                    cap.release()
+                    time.sleep(2.0)
+                    cap        = self._open()
+                    fail_count = 0
+                else:
+                    time.sleep(0.03)
+
+    def get_frame(self):
+        with self._lock:
+            return self._frame.copy() if self._frame is not None else None
+
+    def stop(self):
+        self.running = False
+
+# ============================================================
+# MJPEG STREAM SERVER
+# Runs on port 5000 — website fetches from here
+# ============================================================
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import struct
+
+latest_jpeg = None
+jpeg_lock   = threading.Lock()
+
+class MJPEGHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # suppress access logs
+
+    def do_GET(self):
+        if self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                while True:
+                    with jpeg_lock:
+                        jpg = latest_jpeg
+                    if jpg is not None:
+                        self.wfile.write(b"--frame\r\n")
+                        self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
+                        self.wfile.write(jpg)
+                        self.wfile.write(b"\r\n")
+                    time.sleep(0.033)   # ~30fps
+            except Exception:
+                pass
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def start_stream_server():
+    server = HTTPServer(("0.0.0.0", 5000), MJPEGHandler)
+    print("[Stream] MJPEG server running on port 5000")
+    server.serve_forever()
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
     print("=" * 55)
-    print("  ROBOSAFE Jetson Main - FINAL v2")
+    print("  ROBOSAFE Jetson Main — FINAL")
+    print("  Camera: RJ45 @ 192.168.1.88")
     print("=" * 55)
 
     init_serial()
@@ -350,7 +389,23 @@ def main():
     model = YOLO(MODEL_PATH)
     print("[YOLO] Ready.")
 
-    cap = open_camera(RTSP_URL)
+    # Start MJPEG stream server in background
+    stream_thread = threading.Thread(target=start_stream_server, daemon=True)
+    stream_thread.start()
+
+    # Start background frame grabber
+    grabber = FrameGrabber(RTSP_URL)
+
+    # Wait up to 20s for first frame
+    print("[Camera] Waiting for first frame...")
+    for i in range(20):
+        if grabber.get_frame() is not None:
+            print(f"[Camera] First frame received after {i+1}s ✓")
+            break
+        time.sleep(1.0)
+        print(f"[Camera] Still waiting... {i+1}s")
+    else:
+        print("[Camera] WARNING: No frames — check RJ45 connection")
 
     odo    = Odometry()
     driver = AutoDriver(odo)
@@ -360,33 +415,50 @@ def main():
     last_pos_post   = time.time()
 
     print("[Main] MANUAL mode — waiting for commands.")
+    print("=" * 55)
+
+    global latest_jpeg
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[Camera] Frame lost, reconnecting...")
-            cap.release()
-            time.sleep(1.0)
-            cap = open_camera(RTSP_URL)
+        frame = grabber.get_frame()
+
+        if frame is None:
+            time.sleep(0.05)
             continue
 
-        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+        # Encode frame as JPEG for stream server
+        ret, jpg = cv2.imencode(".jpg", frame,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        if ret:
+            with jpeg_lock:
+                latest_jpeg = jpg.tobytes()
 
-        results    = model.predict(frame, verbose=False, conf=0.35)[0]
-        detections = []
-        if results.boxes is not None:
-            for box in results.boxes:
-                cls  = int(box.cls[0].item())
-                conf = float(box.conf[0].item())
-                if cls == 0:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                    detections.append({
-                        "cls": cls, "confidence": conf,
-                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                    })
+        # YOLO inference
+        try:
+            results    = model.predict(frame, verbose=False, conf=0.35)[0]
+            detections = []
+            if results.boxes is not None:
+                for box in results.boxes:
+                    cls  = int(box.cls[0].item())
+                    conf = float(box.conf[0].item())
+                    if cls == 0:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        detections.append({
+                            "cls":        cls,
+                            "confidence": conf,
+                            "bbox":       [int(x1), int(y1), int(x2), int(y2)],
+                        })
+        except Exception as e:
+            print(f"[YOLO] Error: {e}")
+            detections = []
 
+        # Post to backend
         post_state(len(detections), detections)
 
+        if len(detections) > 0:
+            print(f"[YOLO] {len(detections)} human(s) detected ✓")
+
+        # Mode poll every 1s
         now = time.time()
         if now - last_mode_check > 1.0:
             last_mode_check = now
@@ -399,6 +471,7 @@ def main():
                 elif current_mode == "MANUAL":
                     send_command("STOP")
 
+        # Drive logic
         if current_mode == "AUTO":
             cmd = driver.step(detections, FRAME_WIDTH, FRAME_HEIGHT)
             odo.update(cmd)
@@ -406,15 +479,16 @@ def main():
         else:
             odo.update("STOP")
 
+        # Post rover position every 0.5s
         if now - last_pos_post > 0.5:
             last_pos_post = now
-            px, py, ph = odo.pos()
+            px, py, ph    = odo.position()
             post_rover_position(px, py, ph)
 
-    cap.release()
+    grabber.stop()
+    _executor.shutdown(wait=False)
     if ser:
         ser.close()
-    _executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":
