@@ -45,7 +45,6 @@ class MMWaveState(Base):
 # ─── PHASE 2 MODELS ───────────────────────────────────────────────────────────
 
 class MapFlag(Base):
-    """Flag dropped on map at detection/arrival events."""
     __tablename__ = "map_flags"
     id        = Column(Integer, primary_key=True, index=True)
     ts        = Column(Float,   index=True)
@@ -56,7 +55,6 @@ class MapFlag(Base):
 
 
 class RoverPosition(Base):
-    """Periodic rover position for drawing track on map."""
     __tablename__ = "rover_positions"
     id      = Column(Integer, primary_key=True, index=True)
     ts      = Column(Float,   index=True)
@@ -66,18 +64,30 @@ class RoverPosition(Base):
 
 
 class DriveMode(Base):
-    """Current drive mode — only one row used."""
     __tablename__ = "drive_mode"
     id   = Column(Integer, primary_key=True, index=True)
     mode = Column(String,  default="MANUAL")
 
 
 class AutoCommand(Base):
-    """Latest auto-drive command from Jetson (HTTP fallback)."""
     __tablename__ = "auto_commands"
     id      = Column(Integer, primary_key=True, index=True)
     ts      = Column(Float,   index=True)
     command = Column(String,  default="STOP")
+
+
+class LifeConfirm(Base):
+    """
+    One-row table. Jetson polls this.
+    confirmed=True  → operator has responded.
+    result          → 'alive' | 'not_alive'
+    cleared         → Jetson has acknowledged and reset.
+    """
+    __tablename__ = "life_confirm"
+    id        = Column(Integer, primary_key=True, index=True)
+    confirmed = Column(Boolean, default=False)
+    result    = Column(String,  default="")
+    cleared   = Column(Boolean, default=True)
 
 
 def init_db():
