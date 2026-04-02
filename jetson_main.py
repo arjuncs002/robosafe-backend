@@ -34,8 +34,8 @@ from ultralytics import YOLO
 # ============================================================
 BACKEND_URL   = "https://robosafe-backend.onrender.com"
 RTSP_URL      = "rtsp://admin:@192.168.29.192:554/ch0_0.264"
-MODEL_PATH    = "/home/jetson/robosafe/best.pt"   # absolute path
-SERIAL_PORT   = "/dev/ttyTHS1"                    # Jetson UART TX → ESP32 GPIO32
+MODEL_PATH    = "/robosafe-backend/yolov8n.pt"   # FIXED: correct path inside container
+SERIAL_PORT   = "/dev/ttyTHS0"                    # FIXED: correct Jetson UART port
 SERIAL_BAUD   = 115200
 FRAME_WIDTH   = 640
 FRAME_HEIGHT  = 480
@@ -245,7 +245,7 @@ class AutoDriver:
         self.lost_frames = 0
         self.alert_sent  = False
         self.spin_start  = 0.0
-        self.empty_spins = 0    # count spins with no human found
+        self.empty_spins = 0
 
     def reset(self):
         self.state       = self.SCAN
@@ -256,7 +256,6 @@ class AutoDriver:
     def step(self, detections: list, frame_w: int, frame_h: int) -> str:
         x, y, heading = self.odo.pos()
 
-        # ── SCAN ────────────────────────────────────────────────────────────
         if self.state == self.SCAN:
             if detections:
                 print("[Auto] Human found → APPROACH")
@@ -264,9 +263,8 @@ class AutoDriver:
                 self.lost_frames = 0
                 self.empty_spins = 0
                 post_map_flag("detected", x, y, "Human detected")
-            return "LEFT"   # keep spinning
+            return "LEFT"
 
-        # ── APPROACH ────────────────────────────────────────────────────────
         elif self.state == self.APPROACH:
             if not detections:
                 self.lost_frames += 1
@@ -277,7 +275,6 @@ class AutoDriver:
                 return "FORWARD"
 
             self.lost_frames = 0
-            # Target largest detection
             best = max(detections,
                        key=lambda d: (d["bbox"][2]-d["bbox"][0]) *
                                      (d["bbox"][3]-d["bbox"][1]))
@@ -291,7 +288,6 @@ class AutoDriver:
 
             return cmd
 
-        # ── ARRIVED ─────────────────────────────────────────────────────────
         elif self.state == self.ARRIVED:
             if not self.alert_sent:
                 self.alert_sent = True
@@ -300,7 +296,6 @@ class AutoDriver:
                 self.state = self.WAITING
             return "STOP"
 
-        # ── WAITING ─────────────────────────────────────────────────────────
         elif self.state == self.WAITING:
             confirmed, result = get_life_confirm()
             if confirmed:
@@ -312,7 +307,6 @@ class AutoDriver:
                 self.spin_start = time.time()
             return "STOP"
 
-        # ── SPIN360 ─────────────────────────────────────────────────────────
         elif self.state == self.SPIN360:
             elapsed = time.time() - self.spin_start
             if elapsed >= SPIN_360_DURATION:
@@ -368,7 +362,6 @@ def main():
     print("[Main] MANUAL mode — waiting for commands.")
 
     while True:
-        # ── Camera frame ─────────────────────────────────────────────────
         ret, frame = cap.read()
         if not ret:
             print("[Camera] Frame lost, reconnecting...")
@@ -379,7 +372,6 @@ def main():
 
         frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
-        # ── YOLO ─────────────────────────────────────────────────────────
         results    = model.predict(frame, verbose=False, conf=0.35)[0]
         detections = []
         if results.boxes is not None:
@@ -393,10 +385,8 @@ def main():
                         "bbox": [int(x1), int(y1), int(x2), int(y2)],
                     })
 
-        # Always post state to backend (gauge + history)
         post_state(len(detections), detections)
 
-        # ── Mode poll every 1s ───────────────────────────────────────────
         now = time.time()
         if now - last_mode_check > 1.0:
             last_mode_check = now
@@ -409,7 +399,6 @@ def main():
                 elif current_mode == "MANUAL":
                     send_command("STOP")
 
-        # ── Drive logic ──────────────────────────────────────────────────
         if current_mode == "AUTO":
             cmd = driver.step(detections, FRAME_WIDTH, FRAME_HEIGHT)
             odo.update(cmd)
@@ -417,7 +406,6 @@ def main():
         else:
             odo.update("STOP")
 
-        # ── Post position every 0.5s ─────────────────────────────────────
         if now - last_pos_post > 0.5:
             last_pos_post = now
             px, py, ph = odo.pos()
