@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-ROBOSAFE - Jetson Nano Main (FINAL)
+ROBOSAFE - Jetson Nano Main (FINAL + Bounding Boxes)
 Camera: Essecloud via RJ45 at 192.168.1.88
+Stream: MJPEG with bounding boxes on port 5000
 """
 
 import cv2
@@ -10,6 +11,7 @@ import math
 import serial
 import requests
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from ultralytics import YOLO
 
@@ -17,7 +19,7 @@ from ultralytics import YOLO
 # CONFIG
 # ============================================================
 BACKEND_URL    = "https://robosafe-backend.onrender.com"
-RTSP_URL       = "rtsp://admin:@192.168.1.88:554/ch0_0.264"  # RJ45 direct
+RTSP_URL       = "rtsp://admin:@192.168.1.88:554/ch0_0.264"
 MODEL_PATH     = "/home/project/robosafe/yolov8n.pt"
 SERIAL_PORT    = "/dev/ttyTHS1"
 SERIAL_BAUD    = 115200
@@ -276,8 +278,6 @@ class AutoDriver:
 
 # ============================================================
 # FRAME GRABBER THREAD
-# Runs in background — grabs frames continuously so buffer
-# never fills up. Main thread reads latest frame only.
 # ============================================================
 class FrameGrabber:
     def __init__(self, url: str):
@@ -310,7 +310,6 @@ class FrameGrabber:
             ret, frame = cap.read()
             if ret and frame is not None:
                 fail_count = 0
-                # Resize immediately — faster YOLO + less memory
                 frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
                 with self._lock:
                     self._frame = frame
@@ -333,18 +332,14 @@ class FrameGrabber:
         self.running = False
 
 # ============================================================
-# MJPEG STREAM SERVER
-# Runs on port 5000 — website fetches from here
+# MJPEG STREAM SERVER (port 5000)
 # ============================================================
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import struct
-
 latest_jpeg = None
 jpeg_lock   = threading.Lock()
 
 class MJPEGHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # suppress access logs
+        pass  # suppress logs
 
     def do_GET(self):
         if self.path == "/stream":
@@ -362,7 +357,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                         self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
                         self.wfile.write(jpg)
                         self.wfile.write(b"\r\n")
-                    time.sleep(0.033)   # ~30fps
+                    time.sleep(0.033)
             except Exception:
                 pass
         else:
@@ -371,16 +366,42 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
 def start_stream_server():
     server = HTTPServer(("0.0.0.0", 5000), MJPEGHandler)
-    print("[Stream] MJPEG server running on port 5000")
+    print("[Stream] MJPEG server on port 5000 ✓")
+    print("[Stream] View at: http://192.168.29.6:5000/stream")
     server.serve_forever()
+
+# ============================================================
+# DRAW BOUNDING BOXES ON FRAME
+# ============================================================
+def draw_detections(frame, detections):
+    annotated = frame.copy()
+    for d in detections:
+        x1, y1, x2, y2 = d["bbox"]
+        conf = d["confidence"]
+        # Yellow box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        # Label background
+        label     = f"Human {conf:.0%}"
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        label_y   = max(y1 - 10, lh + 4)
+        cv2.rectangle(annotated,
+                      (x1, label_y - lh - 4),
+                      (x1 + lw, label_y + 2),
+                      (0, 255, 255), -1)
+        # Label text
+        cv2.putText(annotated, label,
+                    (x1, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    return annotated
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
     print("=" * 55)
-    print("  ROBOSAFE Jetson Main — FINAL")
+    print("  ROBOSAFE Jetson Main — FINAL + Bounding Boxes")
     print("  Camera: RJ45 @ 192.168.1.88")
+    print("  Stream: http://192.168.29.6:5000/stream")
     print("=" * 55)
 
     init_serial()
@@ -389,14 +410,14 @@ def main():
     model = YOLO(MODEL_PATH)
     print("[YOLO] Ready.")
 
-    # Start MJPEG stream server in background
-    stream_thread = threading.Thread(target=start_stream_server, daemon=True)
-    stream_thread.start()
+    # Start MJPEG stream server
+    t = threading.Thread(target=start_stream_server, daemon=True)
+    t.start()
 
-    # Start background frame grabber
+    # Start frame grabber
     grabber = FrameGrabber(RTSP_URL)
 
-    # Wait up to 20s for first frame
+    # Wait for first frame
     print("[Camera] Waiting for first frame...")
     for i in range(20):
         if grabber.get_frame() is not None:
@@ -421,17 +442,9 @@ def main():
 
     while True:
         frame = grabber.get_frame()
-
         if frame is None:
             time.sleep(0.05)
             continue
-
-        # Encode frame as JPEG for stream server
-        ret, jpg = cv2.imencode(".jpg", frame,
-                                [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-        if ret:
-            with jpeg_lock:
-                latest_jpeg = jpg.tobytes()
 
         # YOLO inference
         try:
@@ -451,6 +464,16 @@ def main():
         except Exception as e:
             print(f"[YOLO] Error: {e}")
             detections = []
+
+        # ✅ Draw bounding boxes on frame before streaming
+        annotated = draw_detections(frame, detections)
+
+        # Encode annotated frame as JPEG for website
+        ret, jpg = cv2.imencode(".jpg", annotated,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        if ret:
+            with jpeg_lock:
+                latest_jpeg = jpg.tobytes()
 
         # Post to backend
         post_state(len(detections), detections)
