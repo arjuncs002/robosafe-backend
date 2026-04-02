@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
-ROBOSAFE Backend v2 - Fixed
-Key fixes:
- - Boot state: MANUAL mode, mmWave OFF, motors enabled
- - /api/life_confirm endpoints added for Jetson <-> dashboard flow
- - Python 3.8 compatible type hints (Optional instead of str | None)
- - /api/state POST now properly updates human_count to 0 when no detection
- - Token refresh window extended to 10 minutes
- - Drive mode persisted properly
- - Alert state cleaned up
+ROBOSAFE Backend - FINAL
 """
 
 import time
@@ -28,9 +20,9 @@ try:
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
-    cv2   = None
-    YOLO  = None
-    np    = None
+    cv2  = None
+    YOLO = None
+    np   = None
 
 from db import (
     init_db, SessionLocal,
@@ -38,7 +30,7 @@ from db import (
     MapFlag, RoverPosition, DriveMode, AutoCommand, LifeConfirm
 )
 
-app = FastAPI(title="ROBOSAFE Backend v2")
+app = FastAPI(title="ROBOSAFE Backend FINAL")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,28 +42,24 @@ app.add_middleware(
 
 init_db()
 
-# ─── ENSURE INITIAL DB ROWS ───────────────────────────────────────────────────
+# ── DEFAULTS ──────────────────────────────────────────────────────────────────
 def _ensure_defaults():
     try:
         db = SessionLocal()
-        # Drive mode defaults to MANUAL
         if db.query(DriveMode).count() == 0:
             db.add(DriveMode(mode="MANUAL"))
             db.commit()
-        # Life confirm defaults to cleared/not confirmed
         if db.query(LifeConfirm).count() == 0:
             db.add(LifeConfirm(confirmed=False, result="", cleared=True))
             db.commit()
         db.close()
     except Exception as e:
-        print(f"[Init] DB defaults error: {e}")
+        print(f"[Init] DB error: {e}")
 
 _ensure_defaults()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTH
-# ─────────────────────────────────────────────────────────────────────────────
-TOKEN_TTL_SEC = 600          # 10 minutes
+# ── AUTH ──────────────────────────────────────────────────────────────────────
+TOKEN_TTL_SEC = 600
 TOKENS        = {}
 DASH_PASSWORD = {"value": os.getenv("ADMIN_PASSWORD", "GROUP5")}
 
@@ -96,14 +84,11 @@ def verify_token(request: Request, token_query: Optional[str] = None):
     if (now - last) > TOKEN_TTL_SEC:
         TOKENS.pop(token, None)
         raise HTTPException(status_code=401, detail="Token expired")
-    TOKENS[token] = now   # sliding window
+    TOKENS[token] = now
     return token
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CAMERA (optional local mode)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── CAMERA ────────────────────────────────────────────────────────────────────
 USE_LOCAL_CAMERA = os.getenv("USE_LOCAL_CAMERA", "false").lower() == "true"
-
 model = None
 cap   = None
 
@@ -114,80 +99,41 @@ if USE_LOCAL_CAMERA and CV2_AVAILABLE:
         cap   = cv2.VideoCapture(0)
         print("[Camera] Local camera opened")
     except Exception as e:
-        print(f"[Camera] Failed to open local camera: {e}")
-        model = None
-        cap   = None
+        print(f"[Camera] Failed: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IN-MEMORY STATE  (all initialised to safe/off defaults)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── IN-MEMORY STATE ───────────────────────────────────────────────────────────
+STATE = {"ts": time.time(), "human_count": 0, "detections": []}
 
-# Vision state — updated by Jetson POST /api/state
-STATE = {
-    "ts":          time.time(),
-    "human_count": 0,
-    "detections":  [],
-}
+ROVER_STATE = {"last_command": "STOP", "last_command_ts": time.time()}
 
-# Rover command state — updated by dashboard POST /api/control
-ROVER_STATE = {
-    "last_command":    "STOP",
-    "last_command_ts": time.time(),
-}
-
-# mmWave — OFF by default on boot
 MMWAVE_STATE = {
-    "status":               "SENSOR DISABLED",
-    "last_presence":        0,
-    "energy_delta":         0,
-    "respiration_detected": False,
-    "distance":             0.0,
-    "energy_min":           0,
-    "energy_max":           0,
-    "last_update":          0.0,
-    "enabled":              False,   # ← OFF on boot
+    "status": "SENSOR DISABLED", "last_presence": 0,
+    "energy_delta": 0, "respiration_detected": False,
+    "distance": 0.0, "energy_min": 0, "energy_max": 0,
+    "last_update": 0.0, "enabled": False,
 }
 
-# Drive mode — MANUAL on boot
 DRIVE_MODE_STATE = {"mode": "MANUAL"}
 
-# Map
 MAP_STATE = {
-    "rover_x":       0.0,
-    "rover_y":       0.0,
-    "rover_heading": 0.0,
-    "rover_ts":      time.time(),
-    "flags":         [],
-    "track":         [],
+    "rover_x": 0.0, "rover_y": 0.0, "rover_heading": 0.0,
+    "rover_ts": time.time(), "flags": [], "track": [],
 }
 
-# Alert (rover arrived at human)
-ALERT_STATE = {
-    "type":   "",
-    "ts":     0.0,
-    "active": False,
-}
+ALERT_STATE = {"type": "", "ts": 0.0, "active": False}
 
-# Auto command from Jetson
-AUTO_CMD_STATE = {
-    "command": "STOP",
-    "ts":      time.time(),
-}
+AUTO_CMD_STATE = {"command": "STOP", "ts": time.time()}
 
-# Life-confirm handshake (in-memory mirror)
-LIFE_CONFIRM_STATE = {
-    "confirmed": False,
-    "result":    "",     # 'alive' | 'not_alive'
-    "cleared":   True,
-}
+LIFE_CONFIRM_STATE = {"confirmed": False, "result": "", "cleared": True}
+
+# New: manual mode request from Jetson
+MANUAL_REQUEST_STATE = {"active": False, "reason": "", "ts": 0.0}
 
 MIN_LOG_GAP_SEC   = 3.0
 _last_save_ts     = 0.0
 _last_saved_count = -1
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 def save_detection(count: int):
     try:
         db = SessionLocal()
@@ -195,86 +141,40 @@ def save_detection(count: int):
         db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] save_detection error: {e}")
-
-def detect_and_draw(frame):
-    if model is None or not CV2_AVAILABLE:
-        return frame, 0, []
-    results = model.predict(frame, verbose=False)[0]
-    count   = 0
-    dets    = []
-    if results.boxes is not None:
-        for box in results.boxes:
-            cls  = int(box.cls[0].item())
-            conf = float(box.conf[0].item())
-            if cls == 0 and conf >= 0.35:
-                count += 1
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                dets.append({"cls": cls, "confidence": conf,
-                             "bbox": [int(x1), int(y1), int(x2), int(y2)]})
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                cv2.putText(frame, f"Human {conf:.2f}", (x1, max(20, y1-8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-    return frame, count, dets
+        print(f"[DB] save_detection: {e}")
 
 def video_generator():
-    global _last_save_ts, _last_saved_count
-
-    # --- offline / no camera ---
     if not USE_LOCAL_CAMERA or cap is None or not CV2_AVAILABLE:
         if CV2_AVAILABLE and np is not None:
             blank = np.ones((480, 640, 3), dtype=np.uint8) * 30
             cv2.putText(blank, "Camera Offline", (160, 240),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
-            ret, jpeg = cv2.imencode(".jpg", blank,
-                                     [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            ret, jpeg = cv2.imencode(".jpg", blank, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
             frame_bytes = jpeg.tobytes() if ret else b""
         else:
             frame_bytes = b""
         while True:
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                   + frame_bytes + b"\r\n")
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
             time.sleep(0.1)
         return
-
-    # --- local camera loop ---
     while True:
         ok, frame = cap.read()
         if not ok:
             time.sleep(0.05)
             continue
         frame = cv2.resize(frame, (960, 540))
-        frame, count, dets = detect_and_draw(frame)
-
-        STATE["ts"]          = time.time()
-        STATE["human_count"] = count
-        STATE["detections"]  = dets
-
-        if count > 0:
-            now = time.time()
-            if (now - _last_save_ts) >= MIN_LOG_GAP_SEC or count != _last_saved_count:
-                save_detection(count)
-                _last_save_ts     = now
-                _last_saved_count = count
-
-        ret, jpeg = cv2.imencode(".jpg", frame,
-                                 [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        ret, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if not ret:
             continue
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-               + jpeg.tobytes() + b"\r\n")
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── ENDPOINTS ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "robosafe-backend-v2"}
+    return {"ok": True, "service": "robosafe-backend-final"}
 
-
-# ── AUTH ──────────────────────────────────────────────────────────────────────
-
+# AUTH
 @app.post("/api/login")
 async def login(payload: Optional[dict] = None):
     if payload is None:
@@ -283,7 +183,6 @@ async def login(payload: Optional[dict] = None):
     if pw != DASH_PASSWORD["value"]:
         raise HTTPException(status_code=401, detail="Wrong password")
     return {"token": issue_token()}
-
 
 @app.post("/api/password")
 async def change_password(request: Request, payload: Optional[dict] = None):
@@ -295,66 +194,42 @@ async def change_password(request: Request, payload: Optional[dict] = None):
     conf = str(payload.get("confirm_password", "")).strip()
     if cur != DASH_PASSWORD["value"]:
         raise HTTPException(status_code=400, detail="Current password wrong")
-    if not new or not conf:
-        raise HTTPException(status_code=400, detail="New password required")
-    if new != conf:
+    if not new or new != conf:
         raise HTTPException(status_code=400, detail="Passwords do not match")
     if len(new) < 4:
-        raise HTTPException(status_code=400, detail="Password too short")
+        raise HTTPException(status_code=400, detail="Too short")
     DASH_PASSWORD["value"] = new
     return {"ok": True}
 
-
-# ── STATE ─────────────────────────────────────────────────────────────────────
-
+# STATE
 @app.get("/api/state")
 def get_state(request: Request, overlays: int = 1):
     verify_token(request)
     now = time.time()
-    # Auto-reset mmWave if no update for 15 s
     if MMWAVE_STATE["enabled"] and MMWAVE_STATE["last_update"] > 0 and \
             (now - MMWAVE_STATE["last_update"]) > 15:
         MMWAVE_STATE.update({
-            "status":               "NO PRESENCE DETECTED",
-            "last_presence":        0,
-            "energy_delta":         0,
-            "respiration_detected": False,
-            "distance":             0.0,
+            "status": "NO PRESENCE DETECTED", "last_presence": 0,
+            "energy_delta": 0, "respiration_detected": False, "distance": 0.0,
         })
     return JSONResponse({
         "ts":          STATE["ts"],
         "human_count": STATE["human_count"],
         "detections":  STATE["detections"] if overlays == 1 else [],
-        "mmwave": {
-            "status":               MMWAVE_STATE["status"],
-            "last_presence":        MMWAVE_STATE["last_presence"],
-            "energy_delta":         MMWAVE_STATE["energy_delta"],
-            "respiration_detected": MMWAVE_STATE["respiration_detected"],
-            "distance":             MMWAVE_STATE["distance"],
-            "energy_min":           MMWAVE_STATE["energy_min"],
-            "energy_max":           MMWAVE_STATE["energy_max"],
-            "last_update":          MMWAVE_STATE["last_update"],
-            "enabled":              MMWAVE_STATE["enabled"],
-        },
-        "drive_mode": DRIVE_MODE_STATE["mode"],
-        "alert":      ALERT_STATE,
+        "mmwave":      MMWAVE_STATE,
+        "drive_mode":  DRIVE_MODE_STATE["mode"],
+        "alert":       ALERT_STATE,
+        "manual_request": MANUAL_REQUEST_STATE,
     })
-
 
 @app.post("/api/state")
 async def update_state(payload: Optional[dict] = None):
-    """
-    Called by Jetson every frame.
-    No auth required — internal service call.
-    Updates human_count to 0 when no detections (gauge resets correctly).
-    """
     if payload is None:
         payload = {}
     global _last_save_ts, _last_saved_count
     STATE["ts"]          = time.time()
     STATE["human_count"] = int(payload.get("human_count", 0))
-    STATE["detections"]  = payload.get("detections",  [])
-
+    STATE["detections"]  = payload.get("detections", [])
     count = STATE["human_count"]
     if count > 0:
         now = time.time()
@@ -362,15 +237,11 @@ async def update_state(payload: Optional[dict] = None):
             save_detection(count)
             _last_save_ts     = now
             _last_saved_count = count
-
     return {"ok": True}
 
-
-# ── mmWAVE ────────────────────────────────────────────────────────────────────
-
+# MMWAVE
 @app.post("/api/mmwave")
 async def update_mmwave(payload: Optional[dict] = None):
-    """ESP32 posts sensor data here every sync interval."""
     if payload is None:
         payload = {}
     if MMWAVE_STATE["enabled"]:
@@ -384,27 +255,7 @@ async def update_mmwave(payload: Optional[dict] = None):
             "energy_max":           payload.get("energy_max",           0),
             "last_update":          time.time(),
         })
-        asyncio.create_task(_save_mmwave(
-            MMWAVE_STATE["status"],
-            MMWAVE_STATE["last_presence"],
-            MMWAVE_STATE["energy_delta"],
-            MMWAVE_STATE["respiration_detected"],
-        ))
-    # Always return current enabled state so ESP32 can sync its local flag
     return {"ok": True, "enabled": MMWAVE_STATE["enabled"]}
-
-
-async def _save_mmwave(status, presence, energy_delta, respiration):
-    try:
-        db = SessionLocal()
-        db.add(MMWaveState(ts=time.time(), status=status, presence=presence,
-                           energy_delta=energy_delta,
-                           respiration_detected=respiration))
-        db.commit()
-        db.close()
-    except Exception as e:
-        print(f"[DB] _save_mmwave error: {e}")
-
 
 @app.post("/api/mmwave/toggle")
 async def toggle_mmwave(request: Request, payload: Optional[dict] = None):
@@ -415,50 +266,37 @@ async def toggle_mmwave(request: Request, payload: Optional[dict] = None):
     MMWAVE_STATE["enabled"] = enabled
     if not enabled:
         MMWAVE_STATE.update({
-            "status":               "SENSOR DISABLED",
-            "last_presence":        0,
-            "energy_delta":         0,
-            "distance":             0.0,
-            "energy_min":           0,
-            "energy_max":           0,
-            "respiration_detected": False,
+            "status": "SENSOR DISABLED", "last_presence": 0,
+            "energy_delta": 0, "distance": 0.0,
+            "energy_min": 0, "energy_max": 0, "respiration_detected": False,
         })
-        # Stop rover when mmWave is disabled (safe default)
         ROVER_STATE["last_command"]    = "STOP"
         ROVER_STATE["last_command_ts"] = time.time()
     else:
         MMWAVE_STATE["status"]      = "NO PRESENCE DETECTED"
         MMWAVE_STATE["last_update"] = 0.0
-    print(f"[mmWave] {'ENABLED' if enabled else 'DISABLED'}")
     return {"ok": True, "enabled": enabled}
-
 
 @app.get("/api/mmwave")
 def get_mmwave(request: Request):
     verify_token(request)
     return JSONResponse(MMWAVE_STATE)
 
-
-# ── ROVER CONTROL ─────────────────────────────────────────────────────────────
-
+# ROVER CONTROL
 @app.post("/api/control")
 async def control_rover(request: Request, payload: Optional[dict] = None):
-    """Dashboard sends manual drive commands here."""
     verify_token(request)
     if payload is None:
         payload = {}
     command = str(payload.get("command", "STOP")).strip().upper()
-    valid   = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}
-    if command not in valid:
+    if command not in {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}:
         raise HTTPException(status_code=400, detail="Invalid command")
-    # mmWave active blocks movement (safety)
     if MMWAVE_STATE["enabled"] and command != "STOP":
-        return JSONResponse({"ok": False, "reason": "mmWave active — motors disabled"})
+        return JSONResponse({"ok": False, "reason": "mmWave active"})
     ROVER_STATE["last_command"]    = command
     ROVER_STATE["last_command_ts"] = time.time()
     asyncio.create_task(_save_command(command))
-    return {"ok": True, "command": command, "ts": ROVER_STATE["last_command_ts"]}
-
+    return {"ok": True, "command": command}
 
 async def _save_command(command: str):
     try:
@@ -467,58 +305,26 @@ async def _save_command(command: str):
         db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] _save_command error: {e}")
-
+        print(f"[DB] _save_command: {e}")
 
 @app.get("/api/control/latest")
 async def get_latest_command():
-    """
-    ESP32 polls this every 150 ms.
-    In AUTO mode  → return the latest Jetson auto command.
-    In MANUAL mode → return the latest dashboard command.
-    """
-    if DRIVE_MODE_STATE["mode"] == "AUTO":
-        return {
-            "command": AUTO_CMD_STATE["command"],
-            "ts":      AUTO_CMD_STATE["ts"],
-            "source":  "auto",
-        }
+    """ESP32 polls this in MANUAL mode."""
     return {
         "command": ROVER_STATE["last_command"],
         "ts":      ROVER_STATE["last_command_ts"],
         "source":  "manual",
     }
 
-
-# ── AUTO COMMAND (Jetson → backend → ESP32) ───────────────────────────────────
-
-@app.post("/api/auto_command")
-async def set_auto_command(payload: Optional[dict] = None):
-    """Jetson posts its drive decision here (HTTP fallback alongside serial)."""
-    if payload is None:
-        payload = {}
-    cmd = str(payload.get("command", "STOP")).strip().upper()
-    valid = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}
-    if cmd not in valid:
-        cmd = "STOP"
-    AUTO_CMD_STATE["command"] = cmd
-    AUTO_CMD_STATE["ts"]      = time.time()
-    return {"ok": True}
-
-
-# ── DRIVE MODE ────────────────────────────────────────────────────────────────
+# DRIVE MODE
+@app.get("/api/drive_mode/public")
+def get_drive_mode_public():
+    return {"mode": DRIVE_MODE_STATE["mode"]}
 
 @app.get("/api/drive_mode")
 def get_drive_mode(request: Request):
     verify_token(request)
     return {"mode": DRIVE_MODE_STATE["mode"]}
-
-
-@app.get("/api/drive_mode/public")
-def get_drive_mode_public():
-    """Jetson polls this without a token."""
-    return {"mode": DRIVE_MODE_STATE["mode"]}
-
 
 @app.post("/api/drive_mode")
 async def set_drive_mode(request: Request, payload: Optional[dict] = None):
@@ -530,10 +336,11 @@ async def set_drive_mode(request: Request, payload: Optional[dict] = None):
         raise HTTPException(status_code=400, detail="mode must be AUTO or MANUAL")
     DRIVE_MODE_STATE["mode"] = mode
     if mode == "MANUAL":
-        # Immediately stop rover when switching to manual
         ROVER_STATE["last_command"]    = "STOP"
         ROVER_STATE["last_command_ts"] = time.time()
         AUTO_CMD_STATE["command"]      = "STOP"
+    # Clear manual request when operator manually switches
+    MANUAL_REQUEST_STATE["active"] = False
     try:
         db  = SessionLocal()
         row = db.query(DriveMode).first()
@@ -544,53 +351,56 @@ async def set_drive_mode(request: Request, payload: Optional[dict] = None):
         db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] set_drive_mode error: {e}")
-    print(f"[Mode] Switched to {mode}")
+        print(f"[DB] set_drive_mode: {e}")
+    print(f"[Mode] → {mode}")
     return {"ok": True, "mode": mode}
 
-
-# ── ALERT (rover arrived at human) ───────────────────────────────────────────
-
+# ALERT
 @app.post("/api/alert")
-async def post_alert(payload: Optional[dict] = None):
-    """Jetson calls this when rover arrives near a human."""
+async def post_alert_endpoint(payload: Optional[dict] = None):
     if payload is None:
         payload = {}
     ALERT_STATE["type"]   = payload.get("type", "siren")
     ALERT_STATE["ts"]     = time.time()
     ALERT_STATE["active"] = True
-    print("[Alert] Arrival alert triggered")
+    print("[Alert] Triggered")
     return {"ok": True}
-
 
 @app.post("/api/alert/clear")
 async def clear_alert(request: Request):
-    """Dashboard operator dismisses popup."""
     verify_token(request)
     ALERT_STATE["active"] = False
     return {"ok": True}
 
+# MANUAL REQUEST (Jetson → dashboard popup to switch to manual)
+@app.post("/api/manual_request")
+async def post_manual_request(payload: Optional[dict] = None):
+    if payload is None:
+        payload = {}
+    MANUAL_REQUEST_STATE["active"] = True
+    MANUAL_REQUEST_STATE["reason"] = payload.get("reason", "No human found")
+    MANUAL_REQUEST_STATE["ts"]     = time.time()
+    print("[ManualRequest] Jetson requests manual mode")
+    return {"ok": True}
 
-# ── LIFE CONFIRM ──────────────────────────────────────────────────────────────
+@app.post("/api/manual_request/clear")
+async def clear_manual_request(request: Request):
+    verify_token(request)
+    MANUAL_REQUEST_STATE["active"] = False
+    return {"ok": True}
 
+# LIFE CONFIRM
 @app.post("/api/life_confirm")
 async def submit_life_confirm(request: Request, payload: Optional[dict] = None):
-    """
-    Dashboard operator submits vitals result after arrival.
-    payload: { "result": "alive" | "not_alive" }
-    """
     verify_token(request)
     if payload is None:
         payload = {}
     result = str(payload.get("result", "")).strip().lower()
     if result not in ("alive", "not_alive"):
-        raise HTTPException(status_code=400, detail="result must be 'alive' or 'not_alive'")
-
+        raise HTTPException(status_code=400, detail="result must be alive or not_alive")
     LIFE_CONFIRM_STATE["confirmed"] = True
     LIFE_CONFIRM_STATE["result"]    = result
     LIFE_CONFIRM_STATE["cleared"]   = False
-
-    # Persist to DB
     try:
         db  = SessionLocal()
         row = db.query(LifeConfirm).first()
@@ -603,31 +413,22 @@ async def submit_life_confirm(request: Request, payload: Optional[dict] = None):
         db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] life_confirm error: {e}")
-
-    print(f"[LifeConfirm] Result submitted: {result}")
+        print(f"[DB] life_confirm: {e}")
+    print(f"[LifeConfirm] {result}")
     return {"ok": True, "result": result}
-
 
 @app.get("/api/life_confirm/pending")
 async def get_life_confirm_pending():
-    """
-    Jetson polls this to check if operator has responded.
-    Returns confirmed=True only once — after that it waits for /clear.
-    """
     return {
         "confirmed": LIFE_CONFIRM_STATE["confirmed"],
         "result":    LIFE_CONFIRM_STATE["result"],
     }
 
-
 @app.post("/api/life_confirm/clear")
 async def clear_life_confirm():
-    """Jetson calls this after it has processed the confirmation."""
     LIFE_CONFIRM_STATE["confirmed"] = False
     LIFE_CONFIRM_STATE["result"]    = ""
     LIFE_CONFIRM_STATE["cleared"]   = True
-
     try:
         db  = SessionLocal()
         row = db.query(LifeConfirm).first()
@@ -638,13 +439,10 @@ async def clear_life_confirm():
             db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] clear_life_confirm error: {e}")
-
+        print(f"[DB] clear_life_confirm: {e}")
     return {"ok": True}
 
-
-# ── MAP ───────────────────────────────────────────────────────────────────────
-
+# MAP
 @app.post("/api/map/flag")
 async def add_map_flag(payload: Optional[dict] = None):
     if payload is None:
@@ -652,15 +450,14 @@ async def add_map_flag(payload: Optional[dict] = None):
     flag = {
         "id":        int(time.time() * 1000),
         "flag_type": payload.get("flag_type", "detected"),
-        "x":         float(payload.get("x",     0)),
-        "y":         float(payload.get("y",     0)),
-        "label":     payload.get("label",        ""),
-        "ts":        payload.get("ts",  time.time()),
+        "x":         float(payload.get("x",   0)),
+        "y":         float(payload.get("y",   0)),
+        "label":     payload.get("label",      ""),
+        "ts":        payload.get("ts", time.time()),
     }
     MAP_STATE["flags"].append(flag)
     asyncio.create_task(_save_flag(flag))
     return {"ok": True}
-
 
 async def _save_flag(flag: dict):
     try:
@@ -670,14 +467,12 @@ async def _save_flag(flag: dict):
         db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] _save_flag error: {e}")
-
+        print(f"[DB] _save_flag: {e}")
 
 @app.get("/api/map/flags")
 def get_map_flags(request: Request):
     verify_token(request)
     return MAP_STATE["flags"]
-
 
 @app.delete("/api/map/flags")
 def clear_map_flags(request: Request):
@@ -691,37 +486,24 @@ def clear_map_flags(request: Request):
         db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] clear_map_flags error: {e}")
+        print(f"[DB] clear_map_flags: {e}")
     return {"ok": True}
-
 
 @app.post("/api/map/position")
 async def update_rover_position(payload: Optional[dict] = None):
-    """Jetson posts rover position every 0.5 s for map tracking."""
     if payload is None:
         payload = {}
     MAP_STATE["rover_x"]       = float(payload.get("x",       0))
     MAP_STATE["rover_y"]       = float(payload.get("y",       0))
     MAP_STATE["rover_heading"] = float(payload.get("heading", 0))
     MAP_STATE["rover_ts"]      = time.time()
-
-    point = {
-        "x":  MAP_STATE["rover_x"],
-        "y":  MAP_STATE["rover_y"],
-        "ts": MAP_STATE["rover_ts"],
-    }
+    point = {"x": MAP_STATE["rover_x"], "y": MAP_STATE["rover_y"], "ts": MAP_STATE["rover_ts"]}
     MAP_STATE["track"].append(point)
-    # Keep last 2000 points (~17 min at 2 pts/s)
     if len(MAP_STATE["track"]) > 2000:
         MAP_STATE["track"] = MAP_STATE["track"][-2000:]
-
     asyncio.create_task(_save_position(
-        MAP_STATE["rover_x"],
-        MAP_STATE["rover_y"],
-        MAP_STATE["rover_heading"],
-    ))
+        MAP_STATE["rover_x"], MAP_STATE["rover_y"], MAP_STATE["rover_heading"]))
     return {"ok": True}
-
 
 async def _save_position(x, y, heading):
     try:
@@ -730,8 +512,7 @@ async def _save_position(x, y, heading):
         db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] _save_position error: {e}")
-
+        print(f"[DB] _save_position: {e}")
 
 @app.get("/api/map/state")
 def get_map_state(request: Request):
@@ -742,23 +523,17 @@ def get_map_state(request: Request):
         "rover_heading": MAP_STATE["rover_heading"],
         "rover_ts":      MAP_STATE["rover_ts"],
         "flags":         MAP_STATE["flags"],
-        "track":         MAP_STATE["track"][-500:],  # last 500 pts to frontend
+        "track":         MAP_STATE["track"][-500:],
     }
 
-
-# ── VIDEO ─────────────────────────────────────────────────────────────────────
-
+# VIDEO
 @app.get("/video")
 def video(request: Request, token: Optional[str] = None):
     verify_token(request, token_query=token)
-    return StreamingResponse(
-        video_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+    return StreamingResponse(video_generator(),
+                             media_type="multipart/x-mixed-replace; boundary=frame")
 
-
-# ── HISTORY ───────────────────────────────────────────────────────────────────
-
+# HISTORY
 @app.get("/api/history")
 def get_history(request: Request, limit: int = 100):
     verify_token(request)
@@ -768,9 +543,8 @@ def get_history(request: Request, limit: int = 100):
         db.close()
         return [{"ts": r.ts, "count": r.count, "source": r.source} for r in rows]
     except Exception as e:
-        print(f"[DB] get_history error: {e}")
+        print(f"[DB] get_history: {e}")
         return []
-
 
 @app.delete("/api/history")
 def delete_history(request: Request):
@@ -781,22 +555,21 @@ def delete_history(request: Request):
         db.commit()
         db.close()
     except Exception as e:
-        print(f"[DB] delete_history error: {e}")
+        print(f"[DB] delete_history: {e}")
     return {"ok": True}
 
-
-# ── WEBSOCKET ─────────────────────────────────────────────────────────────────
-
+# WEBSOCKET
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     try:
         while True:
             await ws.send_json({
-                "ts":          STATE["ts"],
-                "human_count": STATE["human_count"],
-                "drive_mode":  DRIVE_MODE_STATE["mode"],
-                "alert":       ALERT_STATE,
+                "ts":             STATE["ts"],
+                "human_count":    STATE["human_count"],
+                "drive_mode":     DRIVE_MODE_STATE["mode"],
+                "alert":          ALERT_STATE,
+                "manual_request": MANUAL_REQUEST_STATE,
             })
             await asyncio.sleep(0.25)
     except Exception:

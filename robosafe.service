@@ -1,0 +1,15 @@
+[Unit]
+Description=ROBOSAFE Jetson Main
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/jetson/robosafe/jetson_main.py
+WorkingDirectory=/home/jetson/robosafe
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=5
+User=jetson
+
+[Install]
+WantedBy=multi-user.target
