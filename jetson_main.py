@@ -34,8 +34,8 @@ from ultralytics import YOLO
 # ============================================================
 BACKEND_URL   = "https://robosafe-backend.onrender.com"
 RTSP_URL      = "rtsp://admin:@192.168.29.192:554/ch0_0.264"
-MODEL_PATH    = "/robosafe-backend/yolov8n.pt"   # FIXED: correct path inside container
-SERIAL_PORT   = "/dev/ttyTHS0"                    # FIXED: correct Jetson UART port
+MODEL_PATH    = "/home/project/robosafe/yolov8n.pt"   # FIXED: correct path on Jetson
+SERIAL_PORT   = "/dev/ttyTHS1"                        # FIXED: correct Jetson UART port
 SERIAL_BAUD   = 115200
 FRAME_WIDTH   = 640
 FRAME_HEIGHT  = 480
