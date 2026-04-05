@@ -19,7 +19,7 @@ from ultralytics import YOLO
 # CONFIG
 # ============================================================
 BACKEND_URL    = "https://robosafe-backend.onrender.com"
-RTSP_URL = "rtsp://192.168.225.150:554/ch0_0.264"
+RTSP_URL = "rtsp://admin:@192.168.225.150:554/ch0_0.264"
 MODEL_PATH     = "/home/project/robosafe/yolov8n.pt"
 SERIAL_PORT    = "/dev/ttyTHS1"
 SERIAL_BAUD    = 115200
